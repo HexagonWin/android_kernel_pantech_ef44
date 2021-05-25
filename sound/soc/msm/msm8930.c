@@ -1323,3 +1323,4 @@ module_exit(msm8930_audio_exit);
 
 MODULE_DESCRIPTION("ALSA SoC MSM8930");
 MODULE_LICENSE("GPL v2");
+

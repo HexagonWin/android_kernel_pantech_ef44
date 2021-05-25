@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2012, Code Aurora Forum. All rights reserved.
+/* Copyright (c) 2011-2013 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,6 +25,7 @@
 #include <asm/mach-types.h>
 #include <mach/socinfo.h>
 #include <linux/mfd/wcd9xxx/core.h>
+#include <linux/input.h>
 #include "msm-pcm-routing.h"
 #include "../codecs/wcd9310.h"
 
@@ -87,7 +88,8 @@ static int msm8960_slim_0_tx_ch = 1;
 
 static int msm8960_btsco_rate = SAMPLE_RATE_8KHZ;
 static int msm8960_btsco_ch = 1;
-
+static int hdmi_rate_variable;
+static int msm_hdmi_rx_ch = 2;
 static int msm8960_auxpcm_rate = SAMPLE_RATE_8KHZ;
 
 static struct clk *codec_clk;
@@ -97,10 +99,16 @@ static int msm8960_headset_gpios_configured;
 
 static struct snd_soc_jack hs_jack;
 static struct snd_soc_jack button_jack;
+static atomic_t auxpcm_rsc_ref;
 
 static bool hs_detect_use_gpio;
 module_param(hs_detect_use_gpio, bool, 0444);
 MODULE_PARM_DESC(hs_detect_use_gpio, "Use GPIO for headset detection");
+
+static bool hs_detect_extn_cable;
+module_param(hs_detect_extn_cable, bool, 0444);
+MODULE_PARM_DESC(hs_detect_extn_cable, "Enable extension cable feature");
+
 
 static bool hs_detect_use_firmware;
 module_param(hs_detect_use_firmware, bool, 0444);
@@ -139,6 +147,7 @@ static struct tabla_mbhc_config mbhc_cfg = {
 	.gpio_irq = 0,
 	.gpio_level_insert = 1,
 	.swap_gnd_mic = NULL,
+	.detect_extn_cable = false,
 };
 #endif /* defined(CONFIG_MACH_MSM8960_EF44S) || defined(T_VEGAPVW) */
 #endif /* CONFIG_PANTECH_SND */
@@ -584,6 +593,7 @@ static const struct snd_soc_dapm_route common_audio_map[] = {
 static const char *spk_function[] = {"Off", "On"};
 static const char *slim0_rx_ch_text[] = {"One", "Two"};
 static const char *slim0_tx_ch_text[] = {"One", "Two", "Three", "Four"};
+
 #ifdef CONFIG_PANTECH_SND // [CHD] for bootsound headset path info
 static const char *headset_status_function[] = {"Get"};
 #endif
@@ -657,10 +667,10 @@ static int msm8960_btsco_rate_put(struct snd_kcontrol *kcontrol,
 				struct snd_ctl_elem_value *ucontrol)
 {
 	switch (ucontrol->value.integer.value[0]) {
-	case 0:
+	case 8000:
 		msm8960_btsco_rate = SAMPLE_RATE_8KHZ;
 		break;
-	case 1:
+	case 16000:
 		msm8960_btsco_rate = SAMPLE_RATE_16KHZ;
 		break;
 	default:
@@ -716,6 +726,7 @@ static int headset_status_set(struct snd_kcontrol *kcontrol, struct snd_ctl_elem
 #endif
 
 
+
 static const struct snd_kcontrol_new tabla_msm8960_controls[] = {
 	SOC_ENUM_EXT("Speaker Function", msm8960_enum[0], msm8960_get_spk,
 		msm8960_set_spk),
@@ -731,6 +742,11 @@ static const struct snd_kcontrol_new tabla_msm8960_controls[] = {
 		msm8960_btsco_rate_get, msm8960_btsco_rate_put),
 	SOC_ENUM_EXT("AUX PCM SampleRate", msm8960_auxpcm_enum[0],
 		msm8960_auxpcm_rate_get, msm8960_auxpcm_rate_put),
+	SOC_ENUM_EXT("HDMI RX Rate", msm8960_enum[3],
+					msm8960_hdmi_rate_get,
+					msm8960_hdmi_rate_put),
+	SOC_ENUM_EXT("HDMI_RX Channels", msm8960_enum[4],
+		msm_hdmi_rx_ch_get, msm_hdmi_rx_ch_put),
 };
 
 static void *def_tabla_mbhc_cal(void)
@@ -964,7 +980,7 @@ end:
 
 static int msm8960_audrx_init(struct snd_soc_pcm_runtime *rtd)
 {
-	int err;
+	int err, ret;
 	struct snd_soc_codec *codec = rtd->codec;
 	struct snd_soc_dapm_context *dapm = &codec->dapm;
 	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
@@ -1000,9 +1016,10 @@ static int msm8960_audrx_init(struct snd_soc_pcm_runtime *rtd)
 	snd_soc_dapm_sync(dapm);
 
 	err = snd_soc_jack_new(codec, "Headset Jack",
-			       (SND_JACK_HEADSET | SND_JACK_OC_HPHL |
-				SND_JACK_OC_HPHR | SND_JACK_UNSUPPORTED),
-			       &hs_jack);
+			       (SND_JACK_HEADSET | SND_JACK_LINEOUT |
+				SND_JACK_OC_HPHL | SND_JACK_OC_HPHR |
+				SND_JACK_UNSUPPORTED),
+				&hs_jack);
 	if (err) {
 		pr_err("failed to create new jack\n");
 		return err;
@@ -1013,6 +1030,14 @@ static int msm8960_audrx_init(struct snd_soc_pcm_runtime *rtd)
 	if (err) {
 		pr_err("failed to create new jack\n");
 		return err;
+	}
+
+	ret = snd_jack_set_key(button_jack.jack,
+			       SND_JACK_BTN_0,
+			       KEY_MEDIA);
+	if (ret) {
+		pr_err("%s: Failed to set code for btn-0\n", __func__);
+		return ret;
 	}
 
 	codec_clk = clk_get(cpu_dai->dev, "osr_clk");
@@ -1044,6 +1069,8 @@ static int msm8960_audrx_init(struct snd_soc_pcm_runtime *rtd)
 	if (hs_detect_use_gpio) {
 		mbhc_cfg.gpio = PM8921_GPIO_PM_TO_SYS(JACK_DETECT_GPIO);
 		mbhc_cfg.gpio_irq = JACK_DETECT_INT;
+		if (hs_detect_extn_cable)
+			mbhc_cfg.detect_extn_cable = true;
 	}
 
 #if defined(T_MAGNUS)
@@ -1125,7 +1152,11 @@ static int msm8960_hdmi_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	pr_debug("%s channels->min %u channels->max %u ()\n", __func__,
 			channels->min, channels->max);
 
-	rate->min = rate->max = 48000;
+	if (!hdmi_rate_variable)
+		rate->min = rate->max = 48000;
+	channels->min = channels->max = msm_hdmi_rx_ch;
+	if (channels->max < 2)
+		channels->min = channels->max = 2;
 
 	return 0;
 }
@@ -1239,8 +1270,11 @@ static int msm8960_auxpcm_startup(struct snd_pcm_substream *substream)
 {
 	int ret = 0;
 
-	pr_debug("%s(): substream = %s\n", __func__, substream->name);
-	ret = msm8960_aux_pcm_get_gpios();
+	pr_debug("%s(): substream = %s, auxpcm_rsc_ref counter = %d\n",
+		__func__, substream->name, atomic_read(&auxpcm_rsc_ref));
+	if (atomic_inc_return(&auxpcm_rsc_ref) == 1)
+		ret = msm8960_aux_pcm_get_gpios();
+
 	if (ret < 0) {
 		pr_err("%s: Aux PCM GPIO request failed\n", __func__);
 		return -EINVAL;
@@ -1250,9 +1284,10 @@ static int msm8960_auxpcm_startup(struct snd_pcm_substream *substream)
 
 static void msm8960_auxpcm_shutdown(struct snd_pcm_substream *substream)
 {
-
-	pr_debug("%s(): substream = %s\n", __func__, substream->name);
-	msm8960_aux_pcm_free_gpios();
+	pr_debug("%s(): substream = %s, auxpcm_rsc_ref counter = %d\n",
+		__func__, substream->name, atomic_read(&auxpcm_rsc_ref));
+	if (atomic_dec_return(&auxpcm_rsc_ref) == 0)
+		msm8960_aux_pcm_free_gpios();
 }
 
 static void msm8960_shutdown(struct snd_pcm_substream *substream)
@@ -1451,9 +1486,9 @@ static struct snd_soc_dai_link msm8960_dai_common[] = {
 		.be_id = MSM_FRONTEND_DAI_VOLTE,
 	},
 	{
-		.name = "SGLTE",
-		.stream_name = "SGLTE",
-		.cpu_dai_name   = "SGLTE",
+		.name = "Voice2",
+		.stream_name = "Voice2",
+		.cpu_dai_name   = "Voice2",
 		.platform_name  = "msm-pcm-voice",
 		.dynamic = 1,
 		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
@@ -1463,7 +1498,22 @@ static struct snd_soc_dai_link msm8960_dai_common[] = {
 		.ignore_pmdown_time = 1,/* this dainlink has playback support */
 		.codec_dai_name = "snd-soc-dummy-dai",
 		.codec_name = "snd-soc-dummy",
-		.be_id = MSM_FRONTEND_DAI_SGLTE,
+		.be_id = MSM_FRONTEND_DAI_VOICE2,
+	},
+	{
+		.name = "MSM8960 LowLatency",
+		.stream_name = "MultiMedia5",
+		.cpu_dai_name	= "MultiMedia5",
+		.platform_name  = "msm-lowlatency-pcm-dsp",
+		.dynamic = 1,
+		.codec_dai_name = "snd-soc-dummy-dai",
+		.codec_name = "snd-soc-dummy",
+		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
+					SND_SOC_DPCM_TRIGGER_POST},
+		.ignore_suspend = 1,
+		/* this dainlink has playback support */
+		.ignore_pmdown_time = 1,
+		.be_id = MSM_FRONTEND_DAI_MULTIMEDIA5,
 	},
 	{
 		.name = "MSM8960 LowLatency",
@@ -1588,6 +1638,7 @@ static struct snd_soc_dai_link msm8960_dai_common[] = {
 		.no_pcm = 1,
 		.be_id = MSM_BACKEND_DAI_AUXPCM_TX,
 		.be_hw_params_fixup = msm8960_auxpcm_be_params_fixup,
+		.ops = &msm8960_auxpcm_be_ops,
 	},
 	/* Incall Music BACK END DAI Link */
 	{
@@ -1820,7 +1871,7 @@ static int __init msm8960_audio_init(void)
 {
 	int ret;
 
-	if (!cpu_is_msm8960()) {
+	if (!soc_class_is_msm8960()) {
 		pr_debug("%s: Not the right machine type\n", __func__);
 		return -ENODEV ;
 	}
@@ -1871,11 +1922,18 @@ static int __init msm8960_audio_init(void)
 		return ret;
 	}
 
-	if (msm8960_configure_headset_mic_gpios()) {
-		pr_err("%s Fail to configure headset mic gpios\n", __func__);
+	if (cpu_is_msm8960()) {
+		if (msm8960_configure_headset_mic_gpios()) {
+			pr_err("%s Fail to configure headset mic gpios\n",
+								__func__);
+			msm8960_headset_gpios_configured = 0;
+		} else
+			msm8960_headset_gpios_configured = 1;
+	} else {
 		msm8960_headset_gpios_configured = 0;
-	} else
-		msm8960_headset_gpios_configured = 1;
+		pr_debug("%s headset GPIO 23 and 35 not configured msm960ab",
+								__func__);
+	}
 
 	mutex_init(&cdc_mclk_mutex);
 
@@ -1886,7 +1944,7 @@ module_init(msm8960_audio_init);
 
 static void __exit msm8960_audio_exit(void)
 {
-	if (!cpu_is_msm8960()) {
+	if (!soc_class_is_msm8960()) {
 		pr_debug("%s: Not the right machine type\n", __func__);
 		return ;
 	}
